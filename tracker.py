@@ -256,51 +256,59 @@ class MarketWS:
             self.csvw.write_row([ts, self.market_slug, outcome, token_id, best_bid, best_ask, last_trade])
 
     def on_message(self, ws, message: str):
-        if self._stop:
+    if self._stop:
+        return
+
+    # Siempre loguea algo (aunque sea ping/pong)
+    if message in ("PONG", "PING"):
+        print(f"[WS] {message}")
+        return
+
+    # Imprime el raw si no es JSON
+    try:
+        payload = json.loads(message)
+    except Exception:
+        print("[WS] raw(non-json):", message[:500])
+        return
+
+    # DEBUG: imprime el JSON entero (capado a 2000 chars)
+    raw = json.dumps(payload, ensure_ascii=False)
+    print("[WS] msg:", raw[:2000])
+
+    # Intento normal de extraer token id
+    def try_update_from_obj(obj: dict):
+        token_id = obj.get("asset_id") or obj.get("assetId") or obj.get("token_id") or obj.get("tokenId") or obj.get("id")
+        if token_id and str(token_id) in self.state:
+            tid = str(token_id)
+            self.state[tid].update(obj)
+            self._emit_line(tid)
+            return True
+        return False
+
+    if isinstance(payload, dict):
+        # Caso 1: payload directo
+        if try_update_from_obj(payload):
             return
 
-        if message == "PONG" or message == "PING":
+        # Caso 2: payload tiene "data"
+        d = payload.get("data")
+        if isinstance(d, dict) and try_update_from_obj(d):
             return
 
-        try:
-            payload = json.loads(message)
-        except Exception:
-            # Sometimes non-JSON messages appear
-            return
-
-        # The market channel can send snapshots/updates; we keep it flexible:
-        # If it contains token/asset id + best bid/ask, update state.
-        # We'll look for common keys.
-        token_id = payload.get("asset_id") or payload.get("token_id") or payload.get("id")
-
-        # Sometimes payload may be a list / nested; handle minimal cases
-        if token_id is None and isinstance(payload, dict):
-            # Some messages have "data": {...}
-            d = payload.get("data")
-            if isinstance(d, dict):
-                token_id = d.get("asset_id") or d.get("token_id") or d.get("id")
-                if token_id and token_id in self.state:
-                    self.state[token_id].update(d)
-                    self._emit_line(token_id)
-                    return
-
-            # Some messages have "assets": [...]
-            assets = payload.get("assets")
-            if isinstance(assets, list):
-                for item in assets:
-                    if not isinstance(item, dict):
-                        continue
-                    tid = item.get("asset_id") or item.get("token_id") or item.get("id")
-                    if tid and tid in self.state:
-                        self.state[tid].update(item)
-                        self._emit_line(tid)
+        # Caso 3: payload tiene una lista en alguna key común
+        for k in ("assets", "data", "updates", "items", "market", "markets"):
+            v = payload.get(k)
+            if isinstance(v, list):
+                for item in v:
+                    if isinstance(item, dict):
+                        try_update_from_obj(item)
                 return
 
-            return
-
-        if token_id in self.state:
-            self.state[token_id].update(payload)
-            self._emit_line(token_id)
+    # Caso 4: payload es lista
+    if isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict):
+                try_update_from_obj(item)
 
     def run_forever(self):
         self.ws.run_forever()
